@@ -397,7 +397,7 @@ async def ws_get_zigbee_mesh(
     connection: websocket_api.ActiveConnection,
     msg: dict,
 ) -> None:
-    """Live Zigbee2MQTT network topology (see zigbee_mesh.py).
+    """Live Zigbee network topology, from ZHA or Zigbee2MQTT (see zigbee_mesh.py).
 
     Global/floor-agnostic, like list_areas/list_placeable_entities — the
     frontend cross-references against the current floor's placed pins.

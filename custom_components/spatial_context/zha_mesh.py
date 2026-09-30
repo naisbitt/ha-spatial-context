@@ -72,21 +72,24 @@ def convert_devices(
     return nodes, links
 
 
-async def async_fetch(
-    hass: HomeAssistant, force_refresh: bool, timeout: float
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, str]]:
-    """Read ZHA's topology; with `force_refresh`, rescan every router first.
+async def async_scan(hass: HomeAssistant, timeout: float) -> None:
+    """Rescan every router's neighbor table over the air. Shielded so a
+    timeout stops the wait without cancelling zigpy's scan half-way."""
+    from homeassistant.components.zha.helpers import get_zha_gateway_proxy
 
-    Returns (nodes, raw links, ieee -> HA device_id). Imports ZHA lazily so
-    this integration still loads on a Z2M-only install.
-    """
+    topology = get_zha_gateway_proxy(hass).gateway.application_controller.topology
+    await asyncio.wait_for(asyncio.shield(topology.scan()), timeout=timeout)
+
+
+def read(
+    hass: HomeAssistant,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, str]]:
+    """ZHA's current topology from memory: (nodes, raw links, ieee -> HA
+    device_id). No radio traffic. Imports ZHA lazily so this integration
+    still loads on a Z2M-only install."""
     from homeassistant.components.zha.helpers import get_zha_gateway_proxy
 
     proxy = get_zha_gateway_proxy(hass)
-    if force_refresh:
-        topology = proxy.gateway.application_controller.topology
-        await asyncio.wait_for(topology.scan(), timeout=timeout)
-
     device_registry = dr.async_get(hass)
     devices = []
     ieee_to_device_id: dict[str, str] = {}

@@ -98,3 +98,32 @@ def test_missing_lqi_and_unknown_relationship_are_tolerated():
     _, links = convert_devices(devices)
     assert links[0]["lqi"] is None
     assert links[0]["relationship"] is None
+
+
+def test_cache_only_request_serves_zha_state_from_memory(monkeypatch):
+    """On ZHA the panel's no-scan request gets the live topology with HA
+    device ids, never an empty cache (ZHA's own helpers are faked: the zha
+    library is not a test dependency)."""
+    import types
+
+    from custom_components.spatial_context import zha_mesh, zigbee_mesh
+
+    proxies = {
+        d["ieee"]: types.SimpleNamespace(zha_device_info=d, device_id=f"dev-{i}")
+        for i, d in enumerate(DEVICES)
+    }
+    gateway_proxy = types.SimpleNamespace(device_proxies=proxies)
+    helpers = types.ModuleType("homeassistant.components.zha.helpers")
+    helpers.get_zha_gateway_proxy = lambda hass: gateway_proxy
+    monkeypatch.setitem(sys.modules, "homeassistant.components.zha.helpers", helpers)
+    registry = types.SimpleNamespace(
+        async_get=lambda device_id: types.SimpleNamespace(name_by_user=None, name=device_id)
+    )
+    monkeypatch.setattr(zha_mesh.dr, "async_get", lambda hass: registry)
+    monkeypatch.setattr(zha_mesh, "zha_available", lambda hass: True)
+
+    mesh = zigbee_mesh.get_cached_network_map(types.SimpleNamespace(data={}))
+
+    assert {n["device_id"] for n in mesh["nodes"]} == {"dev-0", "dev-1", "dev-2"}
+    parent = next(link for link in mesh["links"] if link["parent_child"])
+    assert {parent["source_device_id"], parent["target_device_id"]} == {"dev-1", "dev-2"}

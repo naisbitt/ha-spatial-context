@@ -49,6 +49,9 @@ def get_cached_network_map(hass: HomeAssistant) -> dict[str, Any] | None:
     """The last successful result, or None — never triggers a scan. Lets the
     panel show a warm cache the moment the Zigbee layer is picked, without
     risking a 1-2 minute MQTT round trip nobody asked for."""
+    if zha_mesh.zha_available(hass):
+        # ZHA holds the topology in memory, so "cached" is always current.
+        return _zha_network_map(hass)
     cache = _cache(hass)
     if cache.mesh is None:
         return None
@@ -143,13 +146,16 @@ async def async_get_network_map(
 async def _async_get_zha_network_map(
     hass: HomeAssistant, force_refresh: bool
 ) -> dict[str, Any]:
-    """ZHA already holds the topology in memory, so a plain read is instant
-    and is always fresh from there; only `force_refresh` rescans the routers
-    over the air (bounded by the same timeout setting)."""
-    settings = await async_get_settings(hass)
-    nodes, links, ieee_to_device_id = await zha_mesh.async_fetch(
-        hass, force_refresh, settings["zigbee_timeout_seconds"]
-    )
+    """Only `force_refresh` touches the radio (a topology scan, bounded by the
+    same timeout setting); otherwise this is ZHA's in-memory state."""
+    if force_refresh:
+        settings = await async_get_settings(hass)
+        await zha_mesh.async_scan(hass, settings["zigbee_timeout_seconds"])
+    return _zha_network_map(hass)
+
+
+def _zha_network_map(hass: HomeAssistant) -> dict[str, Any]:
+    nodes, links, ieee_to_device_id = zha_mesh.read(hass)
     cache = _cache(hass)
     cache.mesh = {
         "nodes": [
