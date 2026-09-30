@@ -1,4 +1,5 @@
-"""Live Zigbee2MQTT network topology, fetched on demand via MQTT request/response.
+"""Live Zigbee network topology: from ZHA when it is loaded, otherwise
+fetched on demand from Zigbee2MQTT via MQTT request/response.
 
 The processed network map is cached in `hass.data` once fetched
 — not storage.py's Store, since this is live network state, not user-edited
@@ -18,10 +19,10 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from homeassistant.components import mqtt
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr
 
+from . import zha_mesh
 from .const import DOMAIN
 from .storage import async_get_settings
 
@@ -68,6 +69,8 @@ async def async_get_network_map(
     frontend cross-references against placed pins and picks what to draw.
     """
     cache = _cache(hass)
+    if zha_mesh.zha_available(hass):
+        return await _async_get_zha_network_map(hass, force_refresh)
     if not force_refresh and cache.mesh is not None:
         return {**cache.mesh, "fetched_at": cache.fetched_at}
 
@@ -92,6 +95,10 @@ async def async_get_network_map(
         except (json.JSONDecodeError, TypeError):
             return
         response.set_result(payload)
+
+    # Imported here, not at module level: on a ZHA-only install mqtt is not
+    # set up and its client library may not even be installed.
+    from homeassistant.components import mqtt
 
     unsubscribe = await mqtt.async_subscribe(hass, _RESPONSE_TOPIC, _on_message)
     try:
@@ -129,6 +136,35 @@ async def async_get_network_map(
     ]
 
     cache.mesh = {"nodes": out_nodes, "links": out_links}
+    cache.fetched_at = time.time()
+    return {**cache.mesh, "fetched_at": cache.fetched_at}
+
+
+async def _async_get_zha_network_map(
+    hass: HomeAssistant, force_refresh: bool
+) -> dict[str, Any]:
+    """ZHA already holds the topology in memory, so a plain read is instant
+    and is always fresh from there; only `force_refresh` rescans the routers
+    over the air (bounded by the same timeout setting)."""
+    settings = await async_get_settings(hass)
+    nodes, links, ieee_to_device_id = await zha_mesh.async_fetch(
+        hass, force_refresh, settings["zigbee_timeout_seconds"]
+    )
+    cache = _cache(hass)
+    cache.mesh = {
+        "nodes": [
+            {**node, "device_id": ieee_to_device_id.get(node["ieee"])}
+            for node in nodes
+        ],
+        "links": [
+            {
+                **link,
+                "source_device_id": ieee_to_device_id.get(link["source_ieee"]),
+                "target_device_id": ieee_to_device_id.get(link["target_ieee"]),
+            }
+            for link in _merge_links(links)
+        ],
+    }
     cache.fetched_at = time.time()
     return {**cache.mesh, "fetched_at": cache.fetched_at}
 
