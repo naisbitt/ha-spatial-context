@@ -103,6 +103,31 @@ export class SpatialContextPanel extends LitElement {
         padding: 32px;
         color: var(--sc-fg-secondary);
       }
+      .leave-backdrop {
+        position: fixed;
+        inset: 0;
+        z-index: 100;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: rgba(0, 0, 0, 0.4);
+      }
+      .leave-dialog {
+        background: var(--sc-panel-bg);
+        border-radius: var(--sc-panel-radius);
+        box-shadow: var(--sc-panel-shadow);
+        padding: 20px 24px 16px;
+        max-width: min(400px, calc(100vw - 32px));
+      }
+      .leave-title {
+        font-size: 1.15rem;
+        font-weight: 500;
+      }
+      .leave-actions {
+        display: flex;
+        justify-content: flex-end;
+        gap: 8px;
+      }
       .popover-row {
         display: flex;
         align-items: center;
@@ -176,6 +201,12 @@ export class SpatialContextPanel extends LitElement {
     { pin: Pin; floorId: string }
   > = new Map();
   @state() private _dirty = false;
+  /** The open Save / Discard / Stay prompt, if any — resolved by its buttons. */
+  @state() private _leavePrompt: {
+    resolve: (choice: LeaveChoice) => void;
+  } | null = null;
+  /** Set while a confirmed leave is navigating, so the guards let it through. */
+  private _leaving = false;
   @state() private _saving = false;
   @state() private _loading = true;
   @state() private _pendingCount = 0;
@@ -892,7 +923,7 @@ export class SpatialContextPanel extends LitElement {
     opts: { skipDirtyCheck?: boolean } = {},
   ): Promise<void> {
     if (!opts.skipDirtyCheck && this._dirty) {
-      if (!window.confirm("Discard unsaved changes to this floor?")) return;
+      if (!(await this._resolveUnsaved(() => this._save()))) return;
     }
     this._view = "floor";
     const previousBuildingId = this._layout.building_id;
@@ -1028,8 +1059,7 @@ export class SpatialContextPanel extends LitElement {
 
   private async _selectProperty(): Promise<void> {
     if (this._propertyDirty) {
-      if (!window.confirm("Discard unsaved changes to the property view?"))
-        return;
+      if (!(await this._resolveUnsaved(() => this._saveProperty()))) return;
     }
     this._propertyLayout = await this._client.getPropertyLayout();
     this._propertyDirty = false;
@@ -1323,6 +1353,112 @@ export class SpatialContextPanel extends LitElement {
     this._editingWallId = null;
   };
 
+  // --- unsaved-changes guard -------------------------------------------
+
+  private _hasUnsaved(): boolean {
+    return this._dirty || this._propertyDirty;
+  }
+
+  private async _saveAllUnsaved(): Promise<void> {
+    if (this._dirty) await this._save();
+    if (this._propertyDirty) await this._saveProperty();
+  }
+
+  /** Asks Save / Discard / Stay. True means go ahead (saved or discarded);
+   * a failed save keeps the user here with their changes. */
+  private async _resolveUnsaved(save: () => Promise<void>): Promise<boolean> {
+    const choice = await new Promise<LeaveChoice>((resolve) => {
+      this._leavePrompt = { resolve };
+    });
+    this._leavePrompt = null;
+    if (choice === "stay") return false;
+    if (choice === "discard") return true;
+    try {
+      await save();
+      return true;
+    } catch (err) {
+      window.alert(`Save failed: ${String(err)}`);
+      return false;
+    }
+  }
+
+  private async _leaveTo(path: string): Promise<void> {
+    if (!(await this._resolveUnsaved(() => this._saveAllUnsaved()))) return;
+    this._leaving = true;
+    // What HA's own navigate() does.
+    history.pushState(null, "", path);
+    window.dispatchEvent(
+      new CustomEvent("location-changed", { detail: { replace: false } }),
+    );
+  }
+
+  /** In-app links (sidebar and the like) only change the URL, so the panel
+   * is simply detached; catch the click before HA's router sees it. */
+  private _onWindowClick = (e: MouseEvent): void => {
+    if (this._leaving || !this._hasUnsaved() || e.defaultPrevented) return;
+    if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey)
+      return;
+    const anchor = e
+      .composedPath()
+      .find((n): n is HTMLAnchorElement => n instanceof HTMLAnchorElement);
+    if (!anchor?.href || anchor.hasAttribute("download")) return;
+    if (anchor.target && anchor.target !== "_self") return;
+    const url = new URL(anchor.href);
+    if (url.origin !== location.origin || url.pathname === location.pathname)
+      return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    void this._leaveTo(url.pathname + url.search + url.hash);
+  };
+
+  /** Back/forward and HA's own navigate() (quick bar, shortcuts). popstate
+   * is too late — HA detaches the panel on it — but the Navigation API's
+   * navigate event comes first and can be cancelled. */
+  private _onNavigate = (e: NavigateEventLike): void => {
+    if (this._leaving || !this._hasUnsaved() || !e.cancelable) return;
+    if (e.navigationType !== "traverse" && e.navigationType !== "push") return;
+    if (!e.destination.sameDocument) return;
+    const url = new URL(e.destination.url);
+    if (url.pathname === location.pathname) return;
+    e.preventDefault();
+    void this._leaveTo(url.pathname + url.search + url.hash);
+  };
+
+  /** Reload, closing the tab or typing a URL: browsers only allow their own
+   * generic prompt here, so there is no Save option. */
+  private _onBeforeUnload = (e: BeforeUnloadEvent): void => {
+    if (this._leaving || !this._hasUnsaved()) return;
+    e.preventDefault();
+    e.returnValue = "";
+  };
+
+  private _renderLeavePrompt() {
+    const prompt = this._leavePrompt;
+    if (!prompt) return nothing;
+    return html`
+      <div class="leave-backdrop" @click=${() => prompt.resolve("stay")}>
+        <div
+          class="leave-dialog"
+          role="alertdialog"
+          aria-labelledby="leave-title"
+          @click=${(e: Event) => e.stopPropagation()}
+        >
+          <div id="leave-title" class="leave-title">Unsaved changes</div>
+          <p>You have changes that have not been saved.</p>
+          <div class="leave-actions">
+            <button @click=${() => prompt.resolve("stay")}>Cancel</button>
+            <button class="danger" @click=${() => prompt.resolve("discard")}>
+              Discard
+            </button>
+            <button class="primary" @click=${() => prompt.resolve("save")}>
+              Save
+            </button>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
   private _onSaveClick = () => {
     if (this._view === "property") void this._saveProperty();
     else void this._save();
@@ -1562,11 +1698,19 @@ export class SpatialContextPanel extends LitElement {
   override connectedCallback(): void {
     super.connectedCallback();
     window.addEventListener("keydown", this._onKeyDown);
+    this._leaving = false;
+    window.addEventListener("click", this._onWindowClick, true);
+    navigationApi()?.addEventListener("navigate", this._onNavigate);
+    window.addEventListener("beforeunload", this._onBeforeUnload);
   }
 
   override disconnectedCallback(): void {
     super.disconnectedCallback();
     window.removeEventListener("keydown", this._onKeyDown);
+    window.removeEventListener("click", this._onWindowClick, true);
+    navigationApi()?.removeEventListener("navigate", this._onNavigate);
+    window.removeEventListener("beforeunload", this._onBeforeUnload);
+    this._leavePrompt?.resolve("stay");
     this._unsubscribeMatter();
     if (this._zigbeeMeshTimer !== null) {
       window.clearInterval(this._zigbeeMeshTimer);
@@ -2894,9 +3038,27 @@ export class SpatialContextPanel extends LitElement {
               `
         }
       </div>
+      ${this._renderLeavePrompt()}
     `;
   }
 }
+
+type LeaveChoice = "save" | "discard" | "stay";
+
+/** The slice of the Navigation API used here; not in every TS dom lib yet. */
+interface NavigateEventLike extends Event {
+  navigationType: "push" | "replace" | "reload" | "traverse";
+  destination: { url: string; sameDocument: boolean };
+}
+type NavigateListener = (e: NavigateEventLike) => void;
+const navigationApi = ():
+  | {
+      addEventListener(type: "navigate", fn: NavigateListener): void;
+      removeEventListener(type: "navigate", fn: NavigateListener): void;
+    }
+  | undefined =>
+  (window as unknown as { navigation?: ReturnType<typeof navigationApi> })
+    .navigation;
 
 declare global {
   interface HTMLElementTagNameMap {
